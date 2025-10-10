@@ -1,76 +1,102 @@
 """
-Vibe Coder Backend Orchestrator - v2.0 (Planning Agent)
+Vibe Coder Backend Orchestrator - v3.0 (Stateful Agent)
 
-This service acts as the central "Project Manager" agent. It implements the
-"Triage" and "Plan" steps of the core conversational loop. It classifies a
-user's intent and, if it's a task request, calls the architectFlow to
-generate a plan.
+This service acts as the central "Project Manager" agent. It now implements
+a state machine to handle multi-turn conversations, enabling the "Confirm"
+step of the core loop. It uses a simple in-memory dictionary for state
+management as a "Proof of Tool" simplification.
 """
 
 import os
+import uuid
 from flask import Flask, request, jsonify
 import requests
 
 # Create the web server application
 app = Flask(__name__)
 
-# Define the URLs for our AI "Department Heads"
+# --- In-Memory State Management (Proof of Tool Simplification) ---
+# In a production system, this would be a real database (like Firestore).
+conversations = {}
+
+# --- AI Service Endpoints ---
 TASK_CLASSIFIER_URL = "https://australia-southeast1-vibe-agent-final.cloudfunctions.net/taskClassifier"
 ARCHITECT_URL = "https://australia-southeast1-vibe-agent-final.cloudfunctions.net/architect"
 
 @app.route("/chat", methods=["POST"])
 def chat():
     """
-    This endpoint orchestrates the Triage -> Plan workflow.
+    This endpoint now manages a multi-turn conversation using a state machine.
     """
-
-    # 1. Get the user's message from the request.
     incoming_data = request.get_json()
     if not incoming_data or "message" not in incoming_data:
         return jsonify({"error": "Invalid request: 'message' key is required."}), 400
-    
+
     user_message = incoming_data["message"]
-    print(f"[Orchestrator] Received user message: '{user_message}'")
-    
+    conversation_id = incoming_data.get("conversation_id")
+
+    # If no conversation_id is provided, start a new conversation.
+    if not conversation_id:
+        conversation_id = str(uuid.uuid4())
+        conversations[conversation_id] = {"state": "new", "plan": None}
+        print(f"[Orchestrator] New conversation started: {conversation_id}")
+
+    # Retrieve the current state of the conversation.
+    conversation_state = conversations.get(conversation_id, {}).get("state", "new")
+    print(f"[Orchestrator] C_ID: {conversation_id} | Current State: '{conversation_state}'")
+    print(f"[Orchestrator] C_ID: {conversation_id} | User Message: '{user_message}'")
+
     try:
-        # 2. TRIAGE STEP: Call the Task Classifier to get the user's intent.
-        print("[Orchestrator] Calling Task Classifier...")
-        classifier_payload = {"data": user_message}
-        response = requests.post(TASK_CLASSIFIER_URL, json=classifier_payload)
-        response.raise_for_status()
-        
-        intent = response.json().get("result")
-        print(f"[Orchestrator] Received intent: '{intent}'")
-        
-        # 3. ORCHESTRATE: Decide what to do based on the intent.
-        if intent == "task_request":
-            # 4. PLAN STEP: If it's a task, call the Architect to get a plan.
-            print("[Orchestrator] Calling Architect...")
-            architect_payload = {"data": user_message}
-            plan_response = requests.post(ARCHITECT_URL, json=architect_payload)
-            plan_response.raise_for_status()
-            
-            # The architect returns a full plan object.
-            plan = plan_response.json().get("result")
-            print(f"[Orchestrator] Received plan: {plan}")
-            
-            # Return the structured plan to the user.
-            return jsonify({"plan": plan})
-            
-        elif intent == "chitchat":
-            response_message = "TRIAGE: Intent recognized as 'chitchat'. Hello to you too!"
-            return jsonify({"reply": response_message})
-            
-        elif intent == "clarification":
-            response_message = "TRIAGE: Intent recognized as 'clarification'. I will provide more details shortly."
-            return jsonify({"reply": response_message})
-            
+        # --- STATE MACHINE ---
+        if conversation_state == "awaiting_plan_approval":
+            # --- CONFIRM STEP ---
+            if user_message.lower() == "yes":
+                conversations[conversation_id]["state"] = "plan_approved"
+                response_payload = {
+                    "reply": "CONFIRMED: Plan approved. I will begin execution shortly.",
+                    "conversation_id": conversation_id,
+                }
+            else:
+                response_payload = {
+                    "reply": "CONFIRMATION: Plan not approved. Please provide feedback or say 'yes' to approve.",
+                    "conversation_id": conversation_id,
+                }
         else:
-            response_message = "TRIAGE: Could not determine intent. Awaiting further instruction."
-            return jsonify({"reply": response_message})
+            # --- TRIAGE & PLAN STEPS ---
+            print(f"[Orchestrator] C_ID: {conversation_id} | Calling Task Classifier...")
+            classifier_payload = {"data": user_message}
+            response = requests.post(TASK_CLASSIFIER_URL, json=classifier_payload)
+            response.raise_for_status()
+            intent = response.json().get("result")
+            print(f"[Orchestrator] C_ID: {conversation_id} | Received intent: '{intent}'")
+
+            if intent == "task_request":
+                print(f"[Orchestrator] C_ID: {conversation_id} | Calling Architect...")
+                architect_payload = {"data": user_message}
+                plan_response = requests.post(ARCHITECT_URL, json=architect_payload)
+                plan_response.raise_for_status()
+                plan = plan_response.json().get("result")
+                
+                # Save the plan and update the state
+                conversations[conversation_id]["plan"] = plan
+                conversations[conversation_id]["state"] = "awaiting_plan_approval"
+                
+                response_payload = {
+                    "plan": plan,
+                    "reply": "Here is the plan I have generated. Please review and respond with 'yes' to approve.",
+                    "conversation_id": conversation_id,
+                }
+            else: # chitchat, clarification, or unknown
+                response_payload = {
+                    "reply": "TRIAGE: Intent recognized. How can I help with your main task?",
+                    "conversation_id": conversation_id,
+                }
         
+        print(f"[Orchestrator] C_ID: {conversation_id} | Sending response payload.")
+        return jsonify(response_payload)
+
     except requests.exceptions.RequestException as e:
-        print(f"[Orchestrator] Error during AI service call: {e}")
+        print(f"[Orchestrator] C_ID: {conversation_id} | Error during AI service call: {e}")
         return jsonify({"error": "Failed to communicate with the AI service."}), 500
 
 if __name__ == "__main__":
