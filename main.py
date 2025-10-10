@@ -1,10 +1,9 @@
 """
-Vibe Coder Backend Orchestrator - v3.0 (Stateful Agent)
+Vibe Coder Backend Orchestrator - v4.0 (Executing Agent)
 
 This service acts as the central "Project Manager" agent. It now implements
-a state machine to handle multi-turn conversations, enabling the "Confirm"
-step of the core loop. It uses a simple in-memory dictionary for state
-management as a "Proof of Tool" simplification.
+the full, end-to-end "Triage -> Plan -> Confirm -> Execute" conversational loop.
+After a plan is approved, it delegates the first step to the frontendEngineerFlow.
 """
 
 import os
@@ -16,17 +15,17 @@ import requests
 app = Flask(__name__)
 
 # --- In-Memory State Management (Proof of Tool Simplification) ---
-# In a production system, this would be a real database (like Firestore).
 conversations = {}
 
 # --- AI Service Endpoints ---
 TASK_CLASSIFIER_URL = "https://australia-southeast1-vibe-agent-final.cloudfunctions.net/taskClassifier"
 ARCHITECT_URL = "https://australia-southeast1-vibe-agent-final.cloudfunctions.net/architect"
+FRONTEND_ENGINEER_URL = "https://australia-southeast1-vibe-agent-final.cloudfunctions.net/frontendEngineer"
 
 @app.route("/chat", methods=["POST"])
 def chat():
     """
-    This endpoint now manages a multi-turn conversation using a state machine.
+    This endpoint orchestrates the full Triage -> Plan -> Confirm -> Execute workflow.
     """
     incoming_data = request.get_json()
     if not incoming_data or "message" not in incoming_data:
@@ -35,25 +34,40 @@ def chat():
     user_message = incoming_data["message"]
     conversation_id = incoming_data.get("conversation_id")
 
-    # If no conversation_id is provided, start a new conversation.
     if not conversation_id:
         conversation_id = str(uuid.uuid4())
         conversations[conversation_id] = {"state": "new", "plan": None}
         print(f"[Orchestrator] New conversation started: {conversation_id}")
 
-    # Retrieve the current state of the conversation.
-    conversation_state = conversations.get(conversation_id, {}).get("state", "new")
-    print(f"[Orchestrator] C_ID: {conversation_id} | Current State: '{conversation_state}'")
-    print(f"[Orchestrator] C_ID: {conversation_id} | User Message: '{user_message}'")
+    conversation = conversations.get(conversation_id, {})
+    conversation_state = conversation.get("state", "new")
+    print(f"[Orchestrator] C_ID: {conversation_id} | State: '{conversation_state}' | Message: '{user_message}'")
 
     try:
         # --- STATE MACHINE ---
         if conversation_state == "awaiting_plan_approval":
             # --- CONFIRM STEP ---
             if user_message.lower() == "yes":
-                conversations[conversation_id]["state"] = "plan_approved"
+                print(f"[Orchestrator] C_ID: {conversation_id} | Plan approved. Beginning execution.")
+                
+                # --- EXECUTE STEP ---
+                plan = conversation.get("plan")
+                if not plan or not plan.get("steps"):
+                    return jsonify({"error": "Cannot execute: No plan found in conversation."}), 500
+                
+                first_step = plan["steps"][0]
+                print(f"[Orchestrator] C_ID: {conversation_id} | Executing step 1: '{first_step}'")
+                
+                engineer_payload = {"data": first_step}
+                code_response = requests.post(FRONTEND_ENGINEER_URL, json=engineer_payload)
+                code_response.raise_for_status()
+                
+                code_file = code_response.json().get("result")
+                conversations[conversation_id]["state"] = "execution_complete"
+                
                 response_payload = {
-                    "reply": "CONFIRMED: Plan approved. I will begin execution shortly.",
+                    "reply": f"EXECUTION: I have completed the first step: '{first_step}'. Here is the generated code.",
+                    "code_file": code_file,
                     "conversation_id": conversation_id,
                 }
             else:
@@ -63,6 +77,7 @@ def chat():
                 }
         else:
             # --- TRIAGE & PLAN STEPS ---
+            # (This logic remains the same as before)
             print(f"[Orchestrator] C_ID: {conversation_id} | Calling Task Classifier...")
             classifier_payload = {"data": user_message}
             response = requests.post(TASK_CLASSIFIER_URL, json=classifier_payload)
@@ -77,7 +92,6 @@ def chat():
                 plan_response.raise_for_status()
                 plan = plan_response.json().get("result")
                 
-                # Save the plan and update the state
                 conversations[conversation_id]["plan"] = plan
                 conversations[conversation_id]["state"] = "awaiting_plan_approval"
                 
@@ -86,7 +100,7 @@ def chat():
                     "reply": "Here is the plan I have generated. Please review and respond with 'yes' to approve.",
                     "conversation_id": conversation_id,
                 }
-            else: # chitchat, clarification, or unknown
+            else:
                 response_payload = {
                     "reply": "TRIAGE: Intent recognized. How can I help with your main task?",
                     "conversation_id": conversation_id,
