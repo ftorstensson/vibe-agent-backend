@@ -1,20 +1,25 @@
 """
-Vibe Coder Backend Orchestrator - v4.0 (Executing Agent)
+Vibe Coder Backend Orchestrator - v4.1 (CORS Enabled)
 
-This service acts as the central "Project Manager" agent. It now implements
-the full, end-to-end "Triage -> Plan -> Confirm -> Execute" conversational loop.
-After a plan is approved, it delegates the first step to the frontendEngineerFlow.
+This version implements a code-level CORS policy to allow the frontend
+application to securely communicate with this backend service.
 """
 
 import os
 import uuid
 from flask import Flask, request, jsonify
+from flask_cors import CORS # Import the CORS library
 import requests
 
 # Create the web server application
 app = Flask(__name__)
 
-# --- In-Memory State Management (Proof of Tool Simplification) ---
+# --- CORS Configuration ---
+# This is the critical step. We are telling the server to allow requests
+# specifically from our deployed frontend's URL.
+CORS(app, origins=["https://vibe-agent-phoenix.web.app"])
+
+# --- In-Memory State Management ---
 conversations = {}
 
 # --- AI Service Endpoints ---
@@ -27,6 +32,7 @@ def chat():
     """
     This endpoint orchestrates the full Triage -> Plan -> Confirm -> Execute workflow.
     """
+    # ... (The rest of the chat logic is unchanged)
     incoming_data = request.get_json()
     if not incoming_data or "message" not in incoming_data:
         return jsonify({"error": "Invalid request: 'message' key is required."}), 400
@@ -44,16 +50,12 @@ def chat():
     print(f"[Orchestrator] C_ID: {conversation_id} | State: '{conversation_state}' | Message: '{user_message}'")
 
     try:
-        # --- STATE MACHINE ---
         if conversation_state == "awaiting_plan_approval":
-            # --- CONFIRM STEP ---
             if user_message.lower() == "yes":
                 print(f"[Orchestrator] C_ID: {conversation_id} | Plan approved. Beginning execution.")
-                
-                # --- EXECUTE STEP ---
                 plan = conversation.get("plan")
                 if not plan or not plan.get("steps"):
-                    return jsonify({"error": "Cannot execute: No plan found in conversation."}), 500
+                    return jsonify({"error": "Cannot execute: No plan found."}), 500
                 
                 first_step = plan["steps"][0]
                 print(f"[Orchestrator] C_ID: {conversation_id} | Executing step 1: '{first_step}'")
@@ -72,12 +74,10 @@ def chat():
                 }
             else:
                 response_payload = {
-                    "reply": "CONFIRMATION: Plan not approved. Please provide feedback or say 'yes' to approve.",
+                    "reply": "CONFIRMATION: Plan not approved. Please provide feedback.",
                     "conversation_id": conversation_id,
                 }
         else:
-            # --- TRIAGE & PLAN STEPS ---
-            # (This logic remains the same as before)
             print(f"[Orchestrator] C_ID: {conversation_id} | Calling Task Classifier...")
             classifier_payload = {"data": user_message}
             response = requests.post(TASK_CLASSIFIER_URL, json=classifier_payload)
@@ -97,7 +97,7 @@ def chat():
                 
                 response_payload = {
                     "plan": plan,
-                    "reply": "Here is the plan I have generated. Please review and respond with 'yes' to approve.",
+                    "reply": "Here is the plan. Please respond with 'yes' to approve.",
                     "conversation_id": conversation_id,
                 }
             else:
