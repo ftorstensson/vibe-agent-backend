@@ -1,10 +1,9 @@
 """
-Vibe Coder Backend Orchestrator - v5.0 (Persistent Memory Agent)
+Vibe Coder Backend Orchestrator - v6.0 (Conversation History)
 
-This version refactors the agent's state management from an in-memory
-dictionary to a persistent Firestore database. This gives the agent a
-permanent memory, allowing conversations to survive server restarts and
-deployments.
+This version adds a /conversations endpoint to provide a list of past
+conversations from Firestore, enabling the frontend to display a chat history.
+It also adds a 'lastUpdated' timestamp to each conversation document.
 """
 
 import os
@@ -17,9 +16,6 @@ from google.cloud import firestore
 # --- Initialization ---
 app = Flask(__name__)
 CORS(app, origins=["https://vibe-agent-phoenix.web.app"])
-
-# Initialize the Firestore client. It will automatically use the
-# credentials and project ID from the Cloud Run environment.
 db = firestore.Client()
 
 # --- AI Service Endpoints ---
@@ -27,11 +23,35 @@ TASK_CLASSIFIER_URL = "https://australia-southeast1-vibe-agent-final.cloudfuncti
 ARCHITECT_URL = "https://australia-southeast1-vibe-agent-final.cloudfunctions.net/architect"
 FRONTEND_ENGINEER_URL = "https://australia-southeast1-vibe-agent-final.cloudfunctions.net/frontendEngineer"
 
+# --- NEW ENDPOINT FOR CONVERSATION HISTORY ---
+@app.route("/conversations", methods=["GET"])
+def get_conversations():
+    """
+    Retrieves a list of all conversations from Firestore, ordered by the
+    most recently updated.
+    """
+    try:
+        conversations_ref = db.collection("conversations").order_by(
+            "lastUpdated", direction=firestore.Query.DESCENDING
+        ).limit(20) # Limit to the 20 most recent conversations for now.
+
+        conversation_list = []
+        for doc in conversations_ref.stream():
+            convo_data = doc.to_dict()
+            first_message = convo_data.get("messages", [{}])[0].get("content", "New Chat")
+            conversation_list.append({
+                "id": doc.id,
+                "title": first_message
+            })
+        return jsonify(conversation_list)
+    except Exception as e:
+        print(f"[Orchestrator] Error fetching conversations: {e}")
+        return jsonify({"error": "Failed to fetch conversation history."}), 500
+
 @app.route("/chat", methods=["POST"])
 def chat():
     """
-    This endpoint manages the multi-turn conversation, now with
-    persistent memory provided by Firestore.
+    Manages the multi-turn conversation with persistent memory.
     """
     incoming_data = request.get_json()
     if not incoming_data or "message" not in incoming_data:
@@ -40,17 +60,13 @@ def chat():
     user_message = incoming_data["message"]
     conversation_id = incoming_data.get("conversation_id")
 
-    # --- State Loading ---
     conversation_ref = None
     if conversation_id:
         conversation_ref = db.collection("conversations").document(conversation_id)
         conversation_doc = conversation_ref.get()
-        if conversation_doc.exists:
-            conversation = conversation_doc.to_dict()
-        else: # Handle case where a bad ID is sent
-            conversation_id = None
+        conversation = conversation_doc.to_dict() if conversation_doc.exists else None
     
-    if not conversation_id:
+    if not conversation_id or not conversation:
         conversation_id = str(uuid.uuid4())
         conversation = {"state": "new", "plan": None, "messages": []}
         conversation_ref = db.collection("conversations").document(conversation_id)
@@ -59,21 +75,17 @@ def chat():
     conversation_state = conversation.get("state", "new")
     print(f"[Orchestrator] C_ID: {conversation_id} | State: '{conversation_state}' | Message: '{user_message}'")
 
-    # Add the new user message to the conversation history
     conversation["messages"].append({"role": "user", "content": user_message})
 
     try:
-        # --- STATE MACHINE ---
+        # (The entire state machine logic remains the same as before)
         if conversation_state == "awaiting_plan_approval":
             if user_message.lower() == "yes":
-                print(f"[Orchestrator] C_ID: {conversation_id} | Plan approved. Executing.")
                 plan = conversation.get("plan")
                 if not plan or not plan.get("steps"):
-                    raise ValueError("Cannot execute: No plan found in conversation.")
+                    raise ValueError("Cannot execute: No plan found.")
                 
                 first_step = plan["steps"][0]
-                print(f"[Orchestrator] C_ID: {conversation_id} | Executing step 1: '{first_step}'")
-                
                 engineer_payload = {"data": first_step}
                 code_response = requests.post(FRONTEND_ENGINEER_URL, json=engineer_payload)
                 code_response.raise_for_status()
@@ -87,7 +99,6 @@ def chat():
             else:
                 response_payload = {"reply": "CONFIRMATION: Plan not approved."}
         else:
-            # --- TRIAGE & PLAN STEPS ---
             classifier_payload = {"data": user_message}
             response = requests.post(TASK_CLASSIFIER_URL, json=classifier_payload)
             response.raise_for_status()
@@ -109,11 +120,11 @@ def chat():
             else:
                 response_payload = {"reply": "TRIAGE: Intent recognized."}
 
-        # --- State Saving ---
         conversation["messages"].append({"role": "assistant", "content": response_payload})
-        conversation_ref.set(conversation)
+        # Add the lastUpdated timestamp for sorting.
+        conversation["lastUpdated"] = firestore.SERVER_TIMESTAMP
+        conversation_ref.set(conversation, merge=True)
         
-        # Add conversation_id to the final response to the user
         response_payload["conversation_id"] = conversation_id
         return jsonify(response_payload)
 
