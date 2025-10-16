@@ -1,8 +1,9 @@
 """
-Vibe Coder Backend Orchestrator - v9.1 (Unified Brain Executor v2)
+Vibe Coder Backend Orchestrator - v10.0 (Structured History Executor)
 
-This version updates the executor logic to align with the AI Engine's new,
-simpler z.enum-based DecisionSchema.
+This version refactors the chat endpoint to align with the AI Engine's new
+"Structured History" schema. It now saves a single, clean, structured
+assistant message to Firestore per turn.
 """
 
 import os
@@ -15,8 +16,9 @@ from google.cloud import firestore
 
 # --- Initialization ---
 app = Flask(__name__)
+# [SECURITY] Restricting CORS to the production frontend URL.
 CORS(app, origins=["https://vibe-agent-phoenix.web.app"])
-db = firestore.Client()
+db = firestore.Client(project="vibe-agent-final")
 
 # --- AI Service Endpoints ---
 PROJECT_MANAGER_URL = "https://australia-southeast1-vibe-agent-final.cloudfunctions.net/projectManager"
@@ -42,7 +44,7 @@ def chat():
         conversation_ref = db.collection("conversations").document(conversation_id)
         doc = conversation_ref.get()
         if doc.exists: conversation = doc.to_dict()
-    
+
     if not conversation:
         conversation_id = str(uuid.uuid4())
         conversation = {"messages": []}
@@ -70,27 +72,24 @@ def chat():
             plan_response = requests.post(ARCHITECT_URL, json=architect_payload)
             plan_response.raise_for_status()
             plan = plan_response.json().get("result")
-            
-            conversation["messages"].append({"role": "assistant", "content": f"I have generated a plan: {plan}"})
-            
-            print(f"[Executor] C_ID: {conversation_id} | Plan received. Calling brain again for synthesis...")
-            pm_payload_2 = {"data": conversation["messages"]}
-            pm_response_2 = requests.post(PROJECT_MANAGER_URL, json=pm_payload_2)
-            pm_response_2.raise_for_status()
-            final_decision = pm_response_2.json().get("result")
-            
-            response_payload = {"reply": final_decision.get("text"), "plan": plan}
+
+            # [REFACTORED] The 'reply' is now the brain's summary of its
+            # own action, and the plan is included as structured data.
+            response_payload = {"reply": decision.get("text"), "plan": plan}
 
         elif action == "call_engineer":
+            # This logic remains unimplemented for now.
             response_payload = {"reply": "EXECUTION LOGIC NOT YET IMPLEMENTED."}
-        
+
         else:
             raise ValueError(f"Unknown action from brain: {action}")
 
+        # [UNIFIED HISTORY UPDATE] A single, structured message is now appended
+        # to the history, perfectly matching the AI Engine's new schema.
         conversation["messages"].append({"role": "assistant", "content": response_payload})
         conversation["lastUpdated"] = firestore.SERVER_TIMESTAMP
         conversation_ref.set(conversation, merge=True)
-        
+
         response_payload["conversation_id"] = conversation_id
         return jsonify(response_payload)
 
@@ -99,8 +98,9 @@ def chat():
         traceback.print_exc()
         return jsonify({"error": "An internal error occurred."}), 500
 
-# Health check and other endpoints remain the same
-# ... (omitted for brevity)
+@app.route("/")
+def health_check():
+    return "OK", 200
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
