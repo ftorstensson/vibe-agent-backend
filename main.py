@@ -1,10 +1,9 @@
 """
-Vibe Coder Backend Orchestrator - v11.0 (Polished PM Executor)
+Vibe Coder Backend Orchestrator - v12.0 (Living Ledger)
 
-This version implements the "Presentation Loop" for the Polished PM mission.
-When the architect is called, the executor now saves the structured plan to
-history and immediately calls the brain again. This allows the brain to see
-the plan and formulate a natural language presentation for the user.
+This version implements the "Living Ledger" mission by integrating Flasgger
+to generate live, self-updating OpenAPI (Swagger) documentation. A new
+/apidocs endpoint is now available.
 """
 
 import os
@@ -14,22 +13,67 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 from google.cloud import firestore
+from flasgger import Swagger  # [NEW] Import Swagger
 
 # --- Initialization ---
 app = Flask(__name__)
 CORS(app, origins=["https://vibe-agent-phoenix.web.app"])
 db = firestore.Client(project="vibe-agent-final")
 
+# [NEW] Configure Swagger UI
+app.config['SWAGGER'] = {
+    'title': 'Vibe Coder Agency API',
+    'uiversion': 3,
+    'version': '12.0',
+    'description': 'The official API for the Vibe Coder Agency Backend Orchestrator.'
+}
+swagger = Swagger(app)
+
+
 # --- AI Service Endpoints ---
 PROJECT_MANAGER_URL = "https://australia-southeast1-vibe-agent-final.cloudfunctions.net/projectManager"
 ARCHITECT_URL = "https://australia-southeast1-vibe-agent-final.cloudfunctions.net/architect"
 FRONTEND_ENGINEER_URL = "https://australia-southeast1-vibe-agent-final.cloudfunctions.net/frontendEngineer"
 
+
 @app.route("/chat", methods=["POST"])
 def chat():
     """
-    This endpoint is the "Dumb Executor." It loads history, calls the brain,
-    and executes the brain's decision.
+    Handles a user's chat message, orchestrates the AI workflow, and returns the response.
+    ---
+    tags:
+      - Conversations
+    parameters:
+      - in: body
+        name: body
+        schema:
+          id: ChatRequest
+          required:
+            - message
+          properties:
+            message:
+              type: string
+              description: The user's text message.
+            conversation_id:
+              type: string
+              description: The ID of the existing conversation, if any.
+    responses:
+      200:
+        description: The AI's successful response.
+        schema:
+          id: ChatResponse
+          properties:
+            reply:
+              type: string
+              description: The natural language reply from the AI.
+            plan:
+              type: object
+              description: A structured plan object, if generated.
+            conversation_id:
+              type: string
+              description: The ID of the ongoing conversation.
+      500:
+        description: An internal error occurred.
     """
     incoming_data = request.get_json()
     if not incoming_data or "message" not in incoming_data:
@@ -38,6 +82,7 @@ def chat():
     user_message = incoming_data["message"]
     conversation_id = incoming_data.get("conversation_id")
 
+    # ... (rest of the function logic is unchanged) ...
     conversation_ref = None
     conversation = None
     if conversation_id:
@@ -72,10 +117,7 @@ def chat():
             plan_response = requests.post(ARCHITECT_URL, json=architect_payload)
             plan_response.raise_for_status()
             plan = plan_response.json().get("result")
-
-            # [REFACTORED] Create a structured message containing the plan and the
-            # brain's summary of its own action. This message is added to the
-            # history to "inform" the brain of the plan it just created.
+            
             intermediate_message = {
                 "role": "assistant",
                 "content": {"reply": decision.get("text"), "plan": plan}
@@ -87,9 +129,7 @@ def chat():
             pm_response_2 = requests.post(PROJECT_MANAGER_URL, json=pm_payload_2)
             pm_response_2.raise_for_status()
             final_decision = pm_response_2.json().get("result")
-
-            # The final payload contains the brain's natural language presentation
-            # of the plan, as well as the plan object for the frontend to render.
+            
             response_payload = {
                 "reply": final_decision.get("text"),
                 "plan": plan
@@ -97,14 +137,14 @@ def chat():
 
         elif action == "call_engineer":
             response_payload = {"reply": "EXECUTION LOGIC NOT YET IMPLEMENTED."}
-
+        
         else:
             raise ValueError(f"Unknown action from brain: {action}")
 
         conversation["messages"].append({"role": "assistant", "content": response_payload})
         conversation["lastUpdated"] = firestore.SERVER_TIMESTAMP
         conversation_ref.set(conversation, merge=True)
-
+        
         response_payload["conversation_id"] = conversation_id
         return jsonify(response_payload)
 
@@ -115,6 +155,15 @@ def chat():
 
 @app.route("/")
 def health_check():
+    """
+    A simple health check endpoint to confirm the service is running.
+    ---
+    tags:
+      - Health
+    responses:
+      200:
+        description: The service is healthy.
+    """
     return "OK", 200
 
 if __name__ == "__main__":
