@@ -1,9 +1,11 @@
 """
-Vibe Coder Backend Orchestrator - v12.0 (Living Ledger)
+Vibe Coder Backend Orchestrator - v13.0 (The Well-Behaved PM)
 
-This version implements the "Living Ledger" mission by integrating Flasgger
-to generate live, self-updating OpenAPI (Swagger) documentation. A new
-/apidocs endpoint is now available.
+This version implements the "Smarter Code Police" state machine.
+- It adds a 'conversationState' to Firestore to track the conversation's phase.
+- It programmatically enforces the "ask for permission" rule.
+- It intelligently overrides and corrects the AI if it attempts to act
+  out of turn, ensuring a smooth user experience.
 """
 
 import os
@@ -13,22 +15,20 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 from google.cloud import firestore
-from flasgger import Swagger  # [NEW] Import Swagger
+from flasgger import Swagger
 
 # --- Initialization ---
 app = Flask(__name__)
 CORS(app, origins=["https://vibe-agent-phoenix.web.app"])
 db = firestore.Client(project="vibe-agent-final")
 
-# [NEW] Configure Swagger UI
 app.config['SWAGGER'] = {
     'title': 'Vibe Coder Agency API',
     'uiversion': 3,
-    'version': '12.0',
+    'version': '13.0',
     'description': 'The official API for the Vibe Coder Agency Backend Orchestrator.'
 }
 swagger = Swagger(app)
-
 
 # --- AI Service Endpoints ---
 PROJECT_MANAGER_URL = "https://australia-southeast1-vibe-agent-final.cloudfunctions.net/projectManager"
@@ -60,18 +60,6 @@ def chat():
     responses:
       200:
         description: The AI's successful response.
-        schema:
-          id: ChatResponse
-          properties:
-            reply:
-              type: string
-              description: The natural language reply from the AI.
-            plan:
-              type: object
-              description: A structured plan object, if generated.
-            conversation_id:
-              type: string
-              description: The ID of the ongoing conversation.
       500:
         description: An internal error occurred.
     """
@@ -82,7 +70,6 @@ def chat():
     user_message = incoming_data["message"]
     conversation_id = incoming_data.get("conversation_id")
 
-    # ... (rest of the function logic is unchanged) ...
     conversation_ref = None
     conversation = None
     if conversation_id:
@@ -92,8 +79,20 @@ def chat():
 
     if not conversation:
         conversation_id = str(uuid.uuid4())
-        conversation = {"messages": []}
+        # [NEW] Initialize with state for new conversations
+        conversation = {"messages": [], "conversationState": "CLARIFYING"}
         conversation_ref = db.collection("conversations").document(conversation_id)
+
+    # [NEW] State Machine Logic
+    current_state = conversation.get("conversationState", "CLARIFYING")
+    print(f"[Executor] C_ID: {conversation_id} | Current State: {current_state}")
+
+    # Check if the user is giving permission
+    affirmative_responses = ["yes", "yep", "ok", "sounds good", "do it", "perfect"]
+    if current_state == "AWAITING_PERMISSION" and any(phrase in user_message.lower() for phrase in affirmative_responses):
+        print("[Executor] Permission granted by user. Transitioning to PLANNING.")
+        conversation["conversationState"] = "PLANNING"
+        current_state = "PLANNING"
 
     conversation["messages"].append({"role": "user", "content": user_message})
 
@@ -108,8 +107,20 @@ def chat():
         action = decision.get("action")
         response_payload = {}
 
-        if action == "reply_to_user":
+        # --- [NEW] Code Police: Enforce State Rules ---
+        if action == "call_architect" and current_state != "PLANNING":
+            print(f"[Executor] C_ID: {conversation_id} | OVERRIDE: AI tried to call architect in '{current_state}' state. Correcting.")
+            response_payload = {"reply": "That's a great idea! Before I create a plan, I just need your final confirmation. Shall I proceed?"}
+            conversation["conversationState"] = "AWAITING_PERMISSION"
+
+        # --- Standard Action Handling ---
+        elif action == "reply_to_user":
             response_payload = {"reply": decision.get("text")}
+            # Check if the AI is asking for permission
+            permission_phrases = ["shall i proceed", "may i have your permission", "shall i draw up a formal plan"]
+            if any(phrase in decision.get("text").lower() for phrase in permission_phrases):
+                print("[Executor] AI is asking for permission. Transitioning to AWAITING_PERMISSION.")
+                conversation["conversationState"] = "AWAITING_PERMISSION"
 
         elif action == "call_architect":
             print(f"[Executor] C_ID: {conversation_id} | Executing: Call Architect...")
@@ -118,10 +129,7 @@ def chat():
             plan_response.raise_for_status()
             plan = plan_response.json().get("result")
             
-            intermediate_message = {
-                "role": "assistant",
-                "content": {"reply": decision.get("text"), "plan": plan}
-            }
+            intermediate_message = {"role": "assistant", "content": {"reply": decision.get("text"), "plan": plan}}
             conversation["messages"].append(intermediate_message)
 
             print(f"[Executor] C_ID: {conversation_id} | Plan received. Calling brain again for presentation...")
@@ -130,10 +138,9 @@ def chat():
             pm_response_2.raise_for_status()
             final_decision = pm_response_2.json().get("result")
             
-            response_payload = {
-                "reply": final_decision.get("text"),
-                "plan": plan
-            }
+            response_payload = {"reply": final_decision.get("text"), "plan": plan}
+            # Reset state after planning is complete
+            conversation["conversationState"] = "CLARIFYING"
 
         elif action == "call_engineer":
             response_payload = {"reply": "EXECUTION LOGIC NOT YET IMPLEMENTED."}
@@ -155,15 +162,7 @@ def chat():
 
 @app.route("/")
 def health_check():
-    """
-    A simple health check endpoint to confirm the service is running.
-    ---
-    tags:
-      - Health
-    responses:
-      200:
-        description: The service is healthy.
-    """
+    """A simple health check endpoint."""
     return "OK", 200
 
 if __name__ == "__main__":
